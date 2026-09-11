@@ -1,0 +1,41 @@
+# dsh-session-cost-cny 的插件行。
+#
+# 这一层由 `dsh plugin --profile web add dsh-session-cost-cny` 装进 profile 的 bundle 列表后，
+# 在 dsh 启动时被读取；改完配置需要重启 profile（bundle 层在启动时读取）。
+#
+# 全部键都是可选的：
+#   usdCny          number   官网英文页是美元价时的换算汇率（代码默认 6.71；此处以 profile 里的配置为准）
+#   refreshOnStart  boolean  默认 false：启动时先读本地缓存价目表，只有缓存不存在才抓一次官网；
+#                            true 表示每次启动都强制重抓（一般不用，点面板里的 ⟳ 就能更新）。
+#   routeOverrides  array    按渠道覆盖单价，优先级高于官网。
+#
+#   价目表本地缓存：<DSH_HOME>/plugin-data/dsh-session-cost-cny/pricing.json
+#   官网抓取成功（启动时首次抓取，或点 ⟳ 手动刷新）都会重写这个文件；
+#   缓存损坏、格式版本不符、或英文页折算所用的汇率变了，都会当作没有缓存重新抓一次。
+#
+#   单位一律是【人民币元 / 百万 tokens】，与官网中文页价目表同单位；
+#   计费公式：该项花费 = tokens ÷ 1_000_000 × 该项单价（逐条调用按它自己那一刻的峰谷取价）。
+#   字段：
+#     route      "provider/model"，与用量所属路由精确匹配（忽略大小写与空白）
+#     label      展示名（可选）
+#     miss       未命中缓存的输入价（空闲时段；同时也是 missPeak 的缺省值）
+#     missPeak   高峰时段的未命中输入价（可选，不写则与 miss 相同）
+#     hit        缓存读取价（空闲时段；hitPeak 同理可选）
+#     out        输出价（空闲时段；outPeak 同理可选）
+#     write      缓存写入价（不分时段；该渠道不收这项就写 0）
+#
+#   例：下面这组是 opencode-go 的美元价（$0.15 / $0.003 / $0.60 每百万 tokens）按 6.71 换算的结果
+#       —— 0.15×6.71=1.065、0.003×6.71=0.0213、0.60×6.71=4.26。
+#   routeOverrides:
+#     - route: opencode-go/deepseek-flash
+#       label: opencode-go
+#       miss: 1.065
+#       hit: 0.0213
+#       out: 4.26
+#       write: 0
+- insert:
+    - id: session-cost-cny
+      name: dsh-session-cost-cny
+      config:
+        usdCny: 6.71
+        refreshOnStart: false
