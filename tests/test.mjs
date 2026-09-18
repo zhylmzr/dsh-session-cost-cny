@@ -724,6 +724,337 @@ const ROW_URL = ROUTE_PREFIX + '/data?sessionId='
   })
 }
 
+emit('客户端 bundle：装载、槽位注册契约与布局姿态')
+
+const CLIENT_SRC = await readFile(new URL('../lib/client.js', import.meta.url), 'utf8')
+
+/**
+ * 在最小假环境里 materialize 客户端 bundle。
+ * 只桩掉 React 与 document 的表层 API，用来验证"装载 → 注册 → 渲染"这条链路。
+ * @param fakeReact - 注入给 bundle 的 React 替身。
+ * @param existingStyle - 模拟 document 里已存在的旧 <style> 节点（HMR 之后的场景）。
+ * @returns `{ spec, mod, css, appended }`。
+ */
+function loadClientBundle(fakeReact, existingStyle) {
+  let spec = null
+  const created = []
+  const appended = []
+  const fakeDocument = {
+    querySelector() {
+      return existingStyle === undefined ? null : existingStyle
+    },
+    createElement() {
+      const node = { dataset: {}, textContent: '' }
+      created.push(node)
+      return node
+    },
+    head: {
+      appendChild(node) {
+        appended.push(node)
+      },
+    },
+  }
+  const fakeRequire = function (name) {
+    if (name === 'react') return fakeReact
+    if (name === 'react-dom') return { createPortal: (node) => node }
+    throw new Error('意外的模块：' + name)
+  }
+  const loader = {
+    load(registered) {
+      spec = registered
+    },
+  }
+  // 与 shell 一样：脚本执行只登记工厂，副作用发生在工厂体内。
+  new Function('window', 'document', 'require', CLIENT_SRC)({ __ModuleLoader__: loader }, fakeDocument, fakeRequire)
+  const mod = spec.factory(fakeRequire)
+  const tag = existingStyle === undefined ? (created.length > 0 ? created[0] : null) : existingStyle
+  return { spec: spec, mod: mod, css: tag !== null ? tag.textContent : '', appended: appended.length }
+}
+
+/**
+ * 极简 hook 运行时 + 假 React：真的把组件渲染出来（含 setState 触发的重渲染），
+ * 这样"胶囊是不是 flex 行里的普通项""面板里到底有哪几行"这类断言才是结构化的。
+ * @param fetchImpl - 替身 fetch。
+ * @returns `{ React, render }`。
+ */
+function createHarness(fetchImpl) {
+  const slots = []
+  const shared = { index: 0, dirty: false }
+  const sameDeps = function (a, b) {
+    if (a === undefined || b === undefined) return false
+    if (a.length !== b.length) return false
+    for (let i = 0; i < a.length; i += 1) {
+      if (a[i] !== b[i]) return false
+    }
+    return true
+  }
+  const React = {
+    // 函数组件直接调用（真的渲染一遍），宿主元素只记录类型与 props。
+    createElement(type, props, ...children) {
+      const merged = Object.assign({}, props)
+      if (children.length > 0) merged.children = children.length === 1 ? children[0] : children
+      if (typeof type === 'function') return type(merged)
+      return { type: type, props: merged }
+    },
+    useState(initial) {
+      const index = shared.index
+      shared.index += 1
+      if (slots[index] === undefined) slots[index] = { value: initial }
+      const slot = slots[index]
+      return [slot.value, function (next) {
+        slot.value = typeof next === 'function' ? next(slot.value) : next
+        shared.dirty = true
+      }]
+    },
+    useEffect(fn, deps) {
+      const index = shared.index
+      shared.index += 1
+      if (slots[index] === undefined) slots[index] = { deps: undefined }
+      const slot = slots[index]
+      if (!sameDeps(slot.deps, deps)) {
+        slot.deps = deps
+        fn()
+      }
+    },
+    // 面板定位依赖真实视口，这里只占位（必须同样消耗一个槽位，否则后续 hook 序号会错位）。
+    useLayoutEffect() {
+      shared.index += 1
+    },
+    useRef(initial) {
+      const index = shared.index
+      shared.index += 1
+      if (slots[index] === undefined) slots[index] = { current: initial }
+      return slots[index]
+    },
+  }
+  const window = { setTimeout: () => 0, clearTimeout: () => {}, addEventListener: () => {}, removeEventListener: () => {} }
+  /**
+   * 渲染到收敛（setState 会重渲染），返回最后一次的元素树。
+   * @param component - 组件。
+   * @param props - 槽位 props。
+   * @returns 元素树或 null。
+   */
+  async function render(component, props) {
+    for (let round = 0; round < 20; round += 1) {
+      shared.index = 0
+      shared.dirty = false
+      globalThis.fetch = fetchImpl
+      globalThis.window = window
+      const tree = component(props)
+      for (let i = 0; i < 8; i += 1) await Promise.resolve()
+      await new Promise((resolve) => {
+        setTimeout(resolve, 0)
+      })
+      if (!shared.dirty) return tree
+    }
+    throw new Error('渲染没有收敛（可能是 effect 每次都 setState）')
+  }
+  return { React: React, render: render }
+}
+
+const client = loadClientBundle({
+  createElement: (type, props, ...children) => ({ type: type, props: props, children: children }),
+  useState: (value) => [value, () => {}],
+  useEffect: () => {},
+  useLayoutEffect: () => {},
+  useRef: (value) => ({ current: value }),
+})
+
+check('bundle 以 __ModuleLoader__.load 登记，id 与包名一致', () => {
+  assert.equal(client.spec.id, 'dsh-session-cost-cny')
+  assert.equal(typeof client.spec.factory, 'function')
+  assert.equal(typeof client.mod.apply, 'function')
+  assert.deepEqual(client.mod.inject, [])
+})
+
+check('CSS 在工厂体内注入', () => {
+  assert.match(client.css, /\.dshc-chip\{/)
+  assert.match(client.css, /\.dshc-panel\{/)
+})
+
+// HMR（clientModules.rebuilt）会重新 materialize bundle，但 document 里的旧 <style> 还在；
+// 只判"存在就跳过"会留下"新 JS + 旧 CSS"的混合状态。
+check('CSS 注入幂等：同 id 的旧 style 被改写而不是被跳过', () => {
+  const stale = { dataset: { pluginCss: 'dsh-session-cost-cny/client.css' }, textContent: '.dshc-chip{position:absolute;width:0}' }
+  const reloaded = loadClientBundle(
+    { createElement: () => null, useState: (v) => [v, () => {}], useEffect: () => {}, useLayoutEffect: () => {}, useRef: (v) => ({ current: v }) },
+    stale,
+  )
+  assert.equal(reloaded.appended, 0)
+  assert.match(stale.textContent, /\.dshc-root\{display:inline-flex/)
+  assert.equal(stale.textContent.includes('position:absolute'), false)
+  assert.equal(reloaded.css, stale.textContent)
+})
+
+/** 用假 ctx 跑一遍 apply，拿回槽位注册。 */
+function registerClient(mod) {
+  const registrations = []
+  const injected = []
+  mod.apply({
+    get(name) {
+      if (name !== 'slots') return undefined
+      return {
+        inject(key, callback) {
+          injected.push(key)
+          callback()
+        },
+        register(meta, component) {
+          registrations.push({ meta: meta, component: component })
+          return function () {}
+        },
+      }
+    },
+  })
+  return { injected: injected, registrations: registrations }
+}
+
+const registered = registerClient(client.mod)
+
+check('注册进 conversation.composer.dock，order 紧跟官方统计条（0）', () => {
+  assert.deepEqual(registered.injected, ['conversation.composer.dock'])
+  assert.equal(registered.registrations.length, 1)
+  assert.equal(registered.registrations[0].meta.name, 'conversation.composer.dock')
+  assert.equal(registered.registrations[0].meta.id, 'session-cost-cny')
+  assert.equal(registered.registrations[0].meta.order, 1)
+  assert.equal(registered.registrations[0].meta.label, '本会话话费')
+  assert.equal(typeof registered.registrations[0].component, 'function')
+})
+
+// 回归护栏：针对"官方往状态条里新增一项就与本插件重叠"那次故障。
+check('布局姿态：官方 flex 行里的普通项，不再绝对定位 / 不再量测邻居', () => {
+  assert.match(client.css, /\.dshc-root\{[^}]*display:inline-flex/)
+  assert.match(client.css, /\.dshc-root\{[^}]*flex:none/)
+  assert.equal(/\.dshc-chip\{[^}]*position:absolute/.test(client.css), false)
+  assert.equal(client.css.includes('dshc-root-flow'), false)
+  assert.equal(CLIENT_SRC.includes('previousElementSibling'), false)
+  assert.equal(CLIENT_SRC.includes('MutationObserver'), false)
+  // 弹窗仍要贴在芯片正上方：锚点量测只保留在面板定位那一处。
+  assert.equal(CLIENT_SRC.includes('useAnchoredAbove'), true)
+})
+
+// 需求：排在状态条里**所有官方元素**之后。当前版本官方最后一个是上下文圆环（ContextMeter），
+// 它是官方硬编码的兄弟节点、不是槽位条目 —— 槽位注册的 order 排不到它后面，只有 CSS order 可以。
+// 注意断言要写成 `[;{]order:`：`border:none` 里也含 "order:" 这个子串。
+check('排序：CSS order 把芯片排到官方元素（含上下文圆环）之后', () => {
+  assert.match(client.css, /\.dshc-root\{[^}]*[;{]order:1/)
+  assert.equal(/\.dshc-chip\{[^}]*[;{]order:/.test(client.css), false)
+})
+
+emit('客户端渲染：胶囊是状态条行里的普通项，面板内容与门户都对')
+
+const PAYLOAD = {
+  ok: true,
+  hasDeepseek: true,
+  calls: 2,
+  skipped: 0,
+  estimated: false,
+  peakCalls: 1,
+  offCalls: 1,
+  cacheHitRate: 0.5,
+  tokens: { miss: 1000000, hit: 2000000, write: 0, out: 500000, total: 3500000 },
+  cost: { in: 2, hit: 0.04, write: 0, out: 4, cny: 6.04 },
+  routes: [],
+  other: { calls: 1, miss: 0, hit: 0, write: 0, out: 1234, reasoning: 0, total: 1234 },
+  usdCny: 6.71,
+  tierNow: 'offpeak',
+  source: { kind: 'cache' },
+  caveat: '',
+}
+
+/**
+ * 渲染一个会话的胶囊，返回组件树。
+ * @param payload - 宿主响应体。
+ * @param fetchImpl - 可选：替身 fetch（用来模拟"数据一直没到"）。
+ */
+async function renderChip(payload, fetchImpl) {
+  const harness = createHarness(fetchImpl !== undefined
+    ? fetchImpl
+    : async () => ({
+      ok: true,
+      json: async () => payload,
+    }))
+  const loaded = loadClientBundle(harness.React)
+  const reg = registerClient(loaded.mod)
+  const tree = await harness.render(reg.registrations[0].component, { sessionId: 's1' })
+  return { tree: tree, harness: harness, component: reg.registrations[0].component, css: loaded.css }
+}
+
+{
+  const chipCase = await renderChip(PAYLOAD)
+  check('胶囊：外层是无样式的 dshc-root，按钮本身不带任何定位样式', () => {
+    const tree = chipCase.tree
+    assert.notEqual(tree, null)
+    assert.equal(tree.type, 'div')
+    assert.equal(tree.props.className, 'dshc-root')
+    // 关键：容器与按钮都不许带 style（尤其是 position/visibility/left）——
+    // 位置必须完全由官方那一行的 flex 布局决定。
+    assert.equal(tree.props.style, undefined)
+    const chip = tree.props.children
+    assert.equal(chip.type, 'button')
+    assert.equal(chip.props.className, 'dshc-chip')
+    assert.equal(chip.props.style, undefined)
+    assert.equal(chip.props['data-hidden'], '0')
+    assert.equal(chip.props.disabled, false)
+    assert.equal(chip.props.children[1].props.className, 'dshc-amount')
+    assert.equal(chip.props.children[1].props.children, '¥6.040')
+  })
+
+  // 切换会话时最主要的一处抖动：数据未到时"从无到有"。这里必须仍然渲染（占位），只是不可见。
+  const pendingCase = await renderChip(null, () => new Promise(() => {}))
+  check('数据未到：胶囊照常占位但不可见，且不可点 / 不可聚焦', () => {
+    const tree = pendingCase.tree
+    assert.notEqual(tree, null)
+    assert.equal(tree.type, 'div')
+    assert.equal(tree.props.className, 'dshc-root')
+    const chip = tree.props.children
+    assert.equal(chip.type, 'button')
+    assert.equal(chip.props['data-hidden'], '1')
+    assert.equal(chip.props.disabled, true)
+    assert.equal(chip.props.tabIndex, -1)
+    assert.equal(chip.props['aria-hidden'], 'true')
+    // 金额留空，但宽度由 CSS 的 min-width 撑住 —— 和真实金额一样宽，所以布局不抖。
+    assert.equal(chip.props.children[1].props.children, '')
+  })
+
+  check('定宽与隐藏都由 CSS 负责（结构上没有 inline style）', () => {
+    assert.match(chipCase.css, /\.dshc-amount\{[^}]*min-width:5\.5ch/)
+    assert.match(chipCase.css, /\.dshc-chip\[data-hidden="1"\]\{[^}]*visibility:hidden/)
+  })
+
+  const openCase = await renderChip(PAYLOAD)
+  const closed = openCase.tree
+  // 点一下金额：面板展开（setState → 重渲染）。
+  closed.props.children.props.onClick()
+  const opened = await openCase.harness.render(openCase.component, { sessionId: 's1' })
+  check('面板：点了才出现，portal 到 body，行列与金额都对', () => {
+    const portal = opened.props.children
+    const panel = Array.isArray(portal) ? portal[1] : portal
+    assert.equal(panel.type, 'div')
+    assert.equal(panel.props.role, 'dialog')
+    const list = panel.props.children[2]
+    assert.equal(list.type, 'dl')
+    const items = list.props.children
+    const labels = items.filter((node) => node.type === 'dt').map((node) => node.props.children)
+    assert.deepEqual(labels, ['输入 · 未命中缓存', '输入 · 缓存命中', '输出', '其他模型'])
+    const first = items[1].props.children
+    assert.equal(first[1], ' · ¥2.000')
+    const other = items[items.length - 1].props.children
+    assert.equal(other[1], ' · 金额未知')
+  })
+}
+
+check('非 DeepSeek 会话：整枚胶囊不渲染', async () => {
+  const plain = await renderChip({
+    ok: true,
+    hasDeepseek: false,
+    calls: 0,
+    tokens: { miss: 0, hit: 0, write: 0, out: 0, total: 0 },
+    cost: { in: 0, hit: 0, write: 0, out: 0, cny: 0 },
+    other: { calls: 0, total: 0 },
+  })
+  assert.equal(plain.tree, null)
+})
+
 await cleanupTempHome()
 // 等各次 apply() 的异步启动流程收尾（它们的启动日志已经被静音）。
 await new Promise(function (resolve) {

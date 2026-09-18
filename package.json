@@ -1,6 +1,6 @@
 {
   "name": "dsh-session-cost-cny",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "DeepSeek Harness plugin: 在输入框下方状态条实时显示当前会话的 DeepSeek 话费（人民币），点击金额展开输入 / 缓存 / 输出分类花费。价目表取自 DeepSeek 官网，按每次调用的峰谷时段分别计价。",
   "repository": {
     "type": "git",

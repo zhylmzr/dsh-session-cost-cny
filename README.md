@@ -11,7 +11,6 @@
 dsh plugin --profile web add dsh-session-cost-cny
 ```
 
-
 ## 配置
 
 插件行位于本包的 `cordis.patch.yml`，装进 profile 后生效；所有键可选：
